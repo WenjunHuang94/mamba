@@ -56,6 +56,8 @@ class Mamba2(nn.Module):
         sequence_parallel=True,
         device=None,
         dtype=None,
+        bimamba_type="none",
+        if_devide_out=False,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -84,6 +86,8 @@ class Mamba2(nn.Module):
         self.chunk_size = chunk_size
         self.use_mem_eff_path = use_mem_eff_path
         self.layer_idx = layer_idx
+        self.bimamba_type = bimamba_type
+        self.if_devide_out = if_devide_out
 
         # Order: [z, x, B, C, dt]
         d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
@@ -132,6 +136,28 @@ class Mamba2(nn.Module):
         self.D = nn.Parameter(torch.ones(self.d_ssm if self.D_has_hdim else self.nheads, device=device))
         self.D._no_weight_decay = True
 
+        if bimamba_type in ["v2"]:
+            self.conv1d_b = nn.Conv1d(
+                in_channels=conv_dim,
+                out_channels=conv_dim,
+                bias=conv_bias,
+                kernel_size=d_conv,
+                groups=conv_dim,
+                padding=d_conv - 1,
+                **factory_kwargs,
+            )
+            if self.conv_init is not None:
+                nn.init.uniform_(self.conv1d_b.weight, -self.conv_init, self.conv_init)
+
+            self.dt_bias_b = nn.Parameter(inv_dt.clone())
+            self.dt_bias_b._no_weight_decay = True
+
+            self.A_log_b = nn.Parameter(A_log.clone())
+            self.A_log_b._no_weight_decay = True
+
+            self.D_b = nn.Parameter(self.D.clone())
+            self.D_b._no_weight_decay = True
+
         if self.rmsnorm:
             assert RMSNormGated is not None
             self.norm = RMSNormGated(self.d_ssm, eps=1e-5, norm_before_gate=self.norm_before_gate,
@@ -168,33 +194,79 @@ class Mamba2(nn.Module):
                 return out
 
         zxbcdt = self.in_proj(u)  # (B, L, d_in_proj) or (B * L, d_in_proj)
-        if seqlen_og is not None:
+        if seqlen_og is not None:  # None
             zxbcdt = rearrange(zxbcdt, "(b l) d -> b l d", l=seqlen)
         A = -torch.exp(self.A_log)  # (nheads) or (d_inner, d_state)
         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
-        if self.use_mem_eff_path and inference_params is None:
-            out = mamba_split_conv1d_scan_combined(
-                zxbcdt,
-                rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                self.conv1d.bias,
-                self.dt_bias,
-                A,
-                D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
-                chunk_size=self.chunk_size,
-                seq_idx=seq_idx,
-                activation=self.activation,
-                rmsnorm_weight=self.norm.weight if self.rmsnorm else None,
-                rmsnorm_eps=self.norm.eps if self.rmsnorm else 1e-6,
-                outproj_weight=self.out_proj.weight,
-                outproj_bias=self.out_proj.bias,
-                headdim=None if self.D_has_hdim else self.headdim,
-                ngroups=self.ngroups,
-                norm_before_gate=self.norm_before_gate,
-                **dt_limit_kwargs,
-            )
-            if seqlen_og is not None:
+        if self.use_mem_eff_path and inference_params is None:  # 不是generate时进
+            if self.bimamba_type == "v2":  # self.bimamba_type='v2'
+                A_b = -torch.exp(self.A_log_b)
+                out = mamba_split_conv1d_scan_combined(  # (2,64,2048)
+                    zxbcdt,
+                    rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                    self.conv1d.bias,
+                    self.dt_bias,
+                    A,
+                    D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
+                    chunk_size=self.chunk_size,
+                    seq_idx=seq_idx,
+                    activation=self.activation,
+                    rmsnorm_weight=self.norm.weight if self.rmsnorm else None,
+                    rmsnorm_eps=self.norm.eps if self.rmsnorm else 1e-6,
+                    outproj_weight=None,
+                    outproj_bias=None,
+                    headdim=None if self.D_has_hdim else self.headdim,
+                    ngroups=self.ngroups,
+                    norm_before_gate=self.norm_before_gate,
+                    **dt_limit_kwargs,
+                )
+                out_b = mamba_split_conv1d_scan_combined(
+                    zxbcdt.flip(dims=[1]),  # 数据按L反转   Reverse data by L
+                    rearrange(self.conv1d_b.weight, "d 1 w -> d w"),
+                    self.conv1d_b.bias,
+                    self.dt_bias_b,
+                    A_b,
+                    D=rearrange(self.D_b, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D_b,
+                    chunk_size=self.chunk_size,
+                    seq_idx=seq_idx,  # 默认传值为None
+                    activation=self.activation,
+                    rmsnorm_weight=self.norm.weight if self.rmsnorm else None,
+                    rmsnorm_eps=self.norm.eps if self.rmsnorm else 1e-6,
+                    outproj_weight=None,
+                    outproj_bias=None,
+                    headdim=None if self.D_has_hdim else self.headdim,
+                    ngroups=self.ngroups,
+                    norm_before_gate=self.norm_before_gate,
+                    **dt_limit_kwargs,
+                )
+
+                out = F.linear((out + out_b.flip(dims=[1])) / 2, self.out_proj.weight,
+                               self.out_proj.bias)
+
+            else:
+                out = mamba_split_conv1d_scan_combined(  # (2,64,1024)
+                    zxbcdt,  # (B,L,D)  (2,64,4256)
+                    rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                    self.conv1d.bias,
+                    self.dt_bias,
+                    A,
+                    D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
+                    chunk_size=self.chunk_size,
+                    seq_idx=seq_idx,
+                    activation=self.activation,
+                    rmsnorm_weight=self.norm.weight if self.rmsnorm else None,
+                    rmsnorm_eps=self.norm.eps if self.rmsnorm else 1e-6,
+                    outproj_weight=self.out_proj.weight,
+                    outproj_bias=self.out_proj.bias,
+                    headdim=None if self.D_has_hdim else self.headdim,
+                    ngroups=self.ngroups,
+                    norm_before_gate=self.norm_before_gate,
+                    **dt_limit_kwargs,
+                )
+
+            if seqlen_og is not None:  # None 不进入
                 out = rearrange(out, "b l d -> (b l) d")
-            if self.process_group is not None:
+            if self.process_group is not None:  # None 不进入
                 reduce_fn = reduce_scatter if self.sequence_parallel else all_reduce
                 out = reduce_fn(out, self.process_group)
         else:
