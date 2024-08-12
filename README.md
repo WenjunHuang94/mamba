@@ -1,3 +1,6 @@
+About
+Based on the original mamba code: https://github.com/state-spaces/mamba, I have implemented bidirectional scanning and cross scanning mamba.
+
 # Mamba
 
 ![Mamba](assets/selection.png "Selective State Space")
